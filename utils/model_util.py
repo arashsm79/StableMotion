@@ -3,9 +3,13 @@ from diffusion import gaussian_diffusion as gd
 from diffusion.respace import SpacedDiffusion, space_timesteps
 
 def create_model_and_diffusion(args):
+    # Get feature dimensions from args or use default SMPL dimensions
+    feature_dim = getattr(args, 'feature_dim', 167)  # Default to SMPL features
+    print(f"Creating model with feature dimension: {feature_dim}")
+    
     model = StableMotionDiTModel( 
-        in_channels=233,
-        out_channels=233,
+        in_channels=feature_dim,
+        out_channels=feature_dim,
         num_layers=args.layers, # default 8
         num_attention_heads=args.heads, # default 8
         attention_head_dim=64,

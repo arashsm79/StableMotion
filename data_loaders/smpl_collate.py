@@ -36,8 +36,9 @@ def collate_motion(lst_elements: List, *, device: Optional[str] = None) -> Dict:
     one_el = lst_elements[0]
     keys = one_el.keys()
 
-    other_keys = [key for key in keys if key not in ["x"]]
+    other_keys = [key for key in keys if key not in ["x"] and key != "metadata"]
     batch = {key: default_collate([x[key] for x in lst_elements]) for key in other_keys}
+    batch['metadata'] = [x['metadata'] for x in lst_elements]
 
     x = collate_tensor_with_padding([x["x"] for x in lst_elements])
     if device is not None:

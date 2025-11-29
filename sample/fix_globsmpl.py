@@ -22,10 +22,11 @@ from utils.parser_util import det_args
 from utils.model_util import create_model_and_diffusion
 from utils import dist_util
 from data_loaders.get_data import get_dataset_loader
-from data_loaders.amasstools.globsmplrifke_feats import globsmplrifkefeats_to_smpldata
+# from data_loaders.amasstools.globsmplrifke_feats import globsmplrifkefeats_to_smpldata
 
 from ema_pytorch import EMA
 from sample.utils import run_cleanup_selection, prepare_cond_fn, choose_sampler, build_output_dir
+from data_loaders.dlc_keypoint_feats import dlc_dataframe_to_features, features_to_dlc_keypoints
 
 
 
@@ -39,6 +40,7 @@ def detect_labels(
     length,                  # Tensor[int] of shape [B]
     attention_mask,          # [B, N] bool
     motion_normalizer,
+    metadata,                # list of dicts for each sample
 ):
     """
     Detection pass:
@@ -104,9 +106,9 @@ def detect_labels(
     # Read label channel
     sample_det = motion_normalizer.inverse(re_sample.transpose(1, 2).cpu())
     label = sample_det[..., -1] > args.ProbDetTh
-    sample_body = sample_det[..., :-1]
+    sample_body = sample_det
 
-    recon_input_motion = [globsmplrifkefeats_to_smpldata(_s) for _s in sample_body]
+    recon_input_motion = [features_to_dlc_keypoints(_s, _m) for _s, _m in zip(sample_body, metadata)]
 
     # Pack outputs
     out = {
@@ -130,6 +132,7 @@ def fix_motion(
     label,                   # [B, N] bool (CPU or GPU ok)
     re_sample_det_feats,     # [B, C, N] (from detect pass)
     cond_fn=None,            # optional
+    metadata,                # list of dicts for each sample
 ):
     """
     Fix pass:
@@ -229,8 +232,8 @@ def fix_motion(
 
     # Decode
     sample_fix_det = motion_normalizer.inverse(sample_fix.transpose(1, 2).cpu())
-    sample_fix_body = sample_fix_det[..., :-1]
-    fixed_motion = [globsmplrifkefeats_to_smpldata(_s) for _s in sample_fix_body]
+    sample_fix_body = sample_fix_det
+    fixed_motion = [features_to_dlc_keypoints(_s, _m) for _s, _m in zip(sample_fix_body, metadata)]
 
     return {
         "sample_fix_feats": sample_fix,   # [B, C, N]
@@ -260,7 +263,7 @@ def main():
     data = get_dataset_loader(
         name="globsmpl",
         batch_size=args.batch_size,
-        split="test_benchmark",
+        split="test",
         data_dir=args.testdata_dir,
         normalizer_dir=args.normalizer_dir,
         shuffle=False,
@@ -287,12 +290,13 @@ def main():
     # Buffers
     all_motions = []            # decoded SMPL dicts (detected)
     all_lengths = []            # list of np arrays
+    all_metadata = []           # list of metadata dicts
     all_input_motions_vec = []  # raw feature sequences (pre-fix)
     gt_labels_buf = []          # GT boolean labels per frame
 
     all_motions_fix = []        # decoded SMPL dicts (fixed)
     all_fix_motions_vec = []    # raw feature sequences (post-fix)
-    labels = []                 # predicted boolean labels per frame
+    all_labels = []                 # predicted boolean labels per frame
 
     # Loop
     for i, input_batch in enumerate(data):
@@ -301,13 +305,15 @@ def main():
 
         attention_mask = input_batch["mask"].squeeze().bool().clone()
         length = input_batch["length"]
+        metadata = input_batch.get("metadata", [{}]*len(length))
 
         # For collecting GT motions only
         temp_sample = motion_normalizer.inverse(input_motions.transpose(1, 2).cpu())
         if collect_dataset:
-            for _sample in temp_sample:
-                all_motions.append(globsmplrifkefeats_to_smpldata(_sample[..., :-1]))
+            for _sample, _metadata in zip(temp_sample, metadata):
+                all_motions.append(features_to_dlc_keypoints(_sample, _metadata))
             all_lengths.append(length.cpu().numpy())
+            all_metadata.append(metadata)
             continue
 
         # Cache GT labels from label channel
@@ -323,6 +329,7 @@ def main():
             length=length,
             attention_mask=attention_mask,
             motion_normalizer=motion_normalizer,
+            metadata=metadata,
         )
         label = det_out["label"]
         recon_input_motion = det_out["recon_input_motion"]
@@ -330,7 +337,7 @@ def main():
 
         all_motions += recon_input_motion
         all_lengths.append(length.cpu().numpy())
-        labels.append(label.numpy().copy())
+        all_metadata += metadata
         all_input_motions_vec.append(input_motions.transpose(1, 2).cpu().numpy())
         print(f"Detected {len(all_motions)} samples")
 
@@ -338,6 +345,7 @@ def main():
         if args.gtdet:
             print("use gt label")
             label = torch.from_numpy(gt_labels.copy())
+        all_labels += (label.numpy().copy().tolist())
 
         # --- Fix ---
         fix_out = fix_motion(
@@ -351,6 +359,7 @@ def main():
             label=label,
             re_sample_det_feats=re_sample_det_feats,
             cond_fn=cond_fn,
+            metadata=metadata,
         )
         sample_fix_feats = fix_out["sample_fix_feats"]
         fixed_motion = fix_out["fixed_motion"]
@@ -358,6 +367,7 @@ def main():
         all_fix_motions_vec.append(sample_fix_feats.transpose(1, 2).cpu().numpy())
         all_motions_fix += fixed_motion
         print(f"Fixed {len(all_motions_fix)} samples")
+        print("Fixed " + '\n'.join([m['keyid'] for m in all_metadata]))
 
         if args.num_samples and args.batch_size * (i + 1) >= args.num_samples:
             break
@@ -381,7 +391,7 @@ def main():
         {
             "motion": all_motions,
             "motion_fix": all_motions_fix,
-            "label": labels,
+            "label": all_labels,
             "gt_labels": gt_labels_buf,
             "lengths": all_lengths,
             "all_fix_motions_vec": all_fix_motions_vec,
@@ -392,7 +402,7 @@ def main():
         fw.write("\n".join([str(l) for l in all_lengths]))
 
     # Launch eval
-    os.system(f"python -m eval.eval_scripts  --data_path {npy_path} --force_redo")
+    # os.system(f"python -m eval.eval_scripts  --data_path {npy_path} --force_redo")
 
 
 if __name__ == "__main__":

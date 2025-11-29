@@ -42,13 +42,13 @@ def get_dataset(name, split='train', **kwargs):
     DATA = get_dataset_class(name)
     if name == 'globsmpl':
         from data_loaders.globsmpl_dataset import AMASSMotionLoader
-        fps = 20
+        fps = 25
         mode = 'train' if 'train' in split else split
         motion_loader = AMASSMotionLoader(
             base_dir = kwargs['data_dir'],
-            umin_s = 5.,
-            umax_s = 5.,
-            ext = '.npz',
+            umin_s = 10.,
+            umax_s = 10.,
+            ext = '.h5',
             mode = mode,
             fps = fps,
             **kwargs

@@ -58,8 +58,7 @@ def prepare_cond_fn(args, motion_normalizer, device):
     Prepare optional foot-locking guidance function (for classifier guidance).
     Returns cond_fn or None.
     """
-    if not args.classifier_scale:
-        return None
+    return None # Not supported for keypoints
 
     print("Preparing cond function ...")
     j_regressor_stat = np.load("data_loaders/amasstools/smpl_neutral_nobetas_24J.npz")

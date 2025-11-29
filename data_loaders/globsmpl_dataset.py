@@ -3,6 +3,7 @@ import numpy as np
 import os
 import random
 import codecs as cs
+import pandas as pd
 from tqdm import tqdm
 from torch.utils.data import Dataset
 
@@ -44,7 +45,7 @@ class AMASSMotionLoader:
     """
 
     def __init__(
-        self, base_dir, fps=20, disable: bool = False, ext=".npz", umin_s=5.0, umax_s=5.0, mode="train", **kwargs
+        self, base_dir, fps=25, disable: bool = False, ext=".h5", umin_s=5.0, umax_s=5.0, mode="train", **kwargs
     ):
         self.fps = fps
         self.base_dir = base_dir
@@ -56,9 +57,6 @@ class AMASSMotionLoader:
         self.umax = int(self.fps * umax_s)
         self.mode = mode
 
-        j_regressor_stat = np.load("data_loaders/amasstools/smpl_neutral_nobetas_24J.npz")
-        self.J_regressor = torch.from_numpy(j_regressor_stat["J"]).to(torch.double)
-        self.parents = torch.from_numpy(j_regressor_stat["parents"])
         if not disable:
             normalizer_dir = kwargs.get("normalizer_dir", None)
             assert normalizer_dir is not None, "Please provide normalizer_dir when not disable"
@@ -75,61 +73,28 @@ class AMASSMotionLoader:
         Returns:
             dict: {"x": Tensor[T, F], "length": int}
         """
-        path_meta = path.strip().split(",")
-        data_path = path_meta[0]
+        data_path = path
         motion_path = os.path.join(self.base_dir, data_path + self.ext)
-        smpl_data = np.load(motion_path)
-
-        poses = smpl_data["poses"].copy()
-        trans = smpl_data["trans"].copy()
-        labels = smpl_data["labels"].copy() if "labels" in smpl_data else np.zeros_like(trans[:, 0])
-        joints = smpl_data["joints"].copy() if "joints" in smpl_data else None
-
-        poses = torch.from_numpy(poses)
-        trans = torch.from_numpy(trans)  # (T, 3)
-        labels = torch.from_numpy(labels)  # (T,)
-        joints = torch.from_numpy(joints) if joints is not None else None
+        dlc_data = pd.read_hdf(motion_path) # a dataframe
+        initial_offset = 5_000
 
         # Determine crop [start:start+duration]
-        mlen = len(trans)
-        if len(path_meta) == 3:
-            start = eval(path_meta[1])
-            duration = eval(path_meta[2])
-        else:
-            duration = random.randint(min(self.umin, mlen), min(self.umax, mlen))
-            start = random.randint(0, max(mlen - duration, 0))
+        mlen = len(dlc_data)
+        duration = random.randint(min(self.umin, mlen), min(self.umax, mlen))
+        start = random.randint(initial_offset, max(mlen - duration, 0))
 
-        poses = poses[start : start + duration]
-        trans = trans[start : start + duration]
-        joints = joints[start : start + duration] if joints is not None else None
-        labels = labels[start : start + duration]
+        poses = dlc_data.iloc[start : start + duration]
 
-        # Compute joints if missing, using SMPL kinematics
-        if joints is None:
-            _poses = einops.rearrange(poses, "k (l t) -> k l t", t=3)
-            rot_mat = axis_angle_to_matrix(_poses)
-            T = rot_mat.shape[0]
-            zero_hands_rot = torch.eye(3)[None, None].expand(T, 2, -1, -1)
-            rot_mat = torch.concat((rot_mat, zero_hands_rot), dim=1).to(torch.double)
-            joints, _ = batch_rigid_transform(
-                rot_mat,
-                self.J_regressor[None].expand(T, -1, -1),
-                self.parents,
-            )
-            joints = joints.squeeze() + trans.unsqueeze(1)
-            joints = joints.float()
-
-        smpl_data = {"poses": poses, "joints": joints, "trans": trans}
-
-        # Convert to aligned Global SMPL RIFKE features.
-        motion = smpldata_to_alignglobsmplrifkefeats(smpl_data).to(torch.float)
-        motion = torch.cat([motion, labels[:, None]], axis=-1)
+        # Convert to features
+        from data_loaders.dlc_keypoint_feats import dlc_dataframe_to_features
+        motion, metadata = dlc_dataframe_to_features(poses)
+        motion = motion.to(torch.float32)
 
         # Optional normalization
         if not self.disable:
             motion = self.motion_normalizer(motion)
 
-        return {"x": motion, "length": len(motion)}
+        return {"x": motion, "length": len(motion), "metadata": metadata}
 
 
 def read_split(path, split):
@@ -175,7 +140,54 @@ class MotionDataset(Dataset):
         motion_x_dict = self.motion_loader(path=file_path)
         x = motion_x_dict["x"]
         length = motion_x_dict["length"]
-        return {"x": x, "keyid": keyid, "length": length}
+        metadata = motion_x_dict['metadata']
+        metadata['keyid'] = keyid
+        return {"x": x, "keyid": keyid, "length": length, "metadata": metadata}
+
+
+def create_dlc_dataset_splits(base_dir: str, file_pattern: str = "*.h5", 
+                             train_ratio: float = 0.8, val_ratio: float = 0.1):
+    """
+    Create train/val/test splits from DLC files.
+    
+    Args:
+        base_dir: Directory containing DLC files
+        file_pattern: Pattern to match files (e.g., "*.csv")
+        train_ratio: Fraction for training
+        val_ratio: Fraction for validation (test gets remainder)
+        
+    Returns:
+        dict: {"train": [...], "val": [...], "test": [...]} file lists
+    """
+    import glob
+    
+    # Find all matching files
+    pattern_path = os.path.join(base_dir, "**", file_pattern)
+    all_files = glob.glob(pattern_path, recursive=True)
+    
+    # Convert to relative paths without extensions
+    file_ids = []
+    for file_path in all_files:
+        rel_path = os.path.relpath(file_path, base_dir)
+        rel_path_no_ext = os.path.splitext(rel_path)[0]
+        file_ids.append(rel_path_no_ext)
+    
+    file_ids.sort()  # For reproducibility
+    
+    # Create splits
+    n_files = len(file_ids)
+    n_train = int(n_files * train_ratio)
+    n_val = int(n_files * val_ratio)
+    
+    train_files = file_ids[:n_train]
+    val_files = file_ids[n_train:n_train + n_val]
+    test_files = file_ids[n_train + n_val:]
+    
+    return {
+        "train": train_files,
+        "val": val_files,
+        "test": test_files
+    }
 
 
 if __name__ == "__main__":
@@ -183,20 +195,20 @@ if __name__ == "__main__":
 
     # Example: compute normalization stats from corrupted-canonicalized data.
     motion_loader = AMASSMotionLoader(
-        base_dir="dataset/AMASS_20.0_fps_nh_globsmpl_corrupted_cano",
+        base_dir="dlc_data/dlc_data_raw",
         disable=True,
     )
     motion_dataset = MotionDataset(motion_loader=motion_loader, split="train")
 
     motion_normalizer = Normalizer(
-        base_dir="dataset/meta_AMASS_20.0_fps_nh_globsmpl_corrupted_cano",
+        base_dir="dlc_data/dlc_data_meta",
         disable=True,
     )
 
     # Accumulate features and compute mean/std (excluding label channel).
     # Tip: you may manually adjust the scale of root features standard deviation
     data_bank = []
-    for _ in range(3):
+    for _ in range(10):
         data_bank += [x["x"] for x in tqdm(motion_dataset)]
     motionfeats = torch.cat(data_bank)
     mean_motionfeats = motionfeats.mean(0)[:-1]

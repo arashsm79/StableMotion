@@ -147,7 +147,7 @@ def add_training_options(parser: ArgumentParser):
     group.add_argument("--weight_decay", default=0.0, type=float, help="AdamW weight decay.")
     group.add_argument("--lr_anneal_steps", default=0, type=int, help="LR anneal steps.")
     group.add_argument("--log_interval", default=1_000, type=int, help="Log every N steps.")
-    group.add_argument("--save_interval", default=50_000, type=int, help="Save/eval every N steps.")
+    group.add_argument("--save_interval", default=20_000, type=int, help="Save/eval every N steps.")
     group.add_argument("--num_steps", default=1_000_000, type=int, help="Total training steps.")
     group.add_argument(
         "--eval_during_training",
@@ -223,7 +223,7 @@ def add_sampling_options(parser: ArgumentParser):
         type=str,
         help="Directory for results (auto-created). If empty, created next to checkpoint.",
     )
-    group.add_argument("--num_samples", default=0, type=int, help="Max number of samples to process.")
+    group.add_argument("--num_samples", default=10, type=int, help="Max number of samples to process.")
     group.add_argument(
         "--skip_timesteps",
         default=0,

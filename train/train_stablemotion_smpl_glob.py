@@ -48,6 +48,11 @@ def main():
     )
 
     print("creating model and diffusion...")
+    samples = [data.dataset[i] for i in range(2)]
+    data.dataset.collate_fn(samples)  # warm up collate function
+    sample_batch = next(iter(data))
+    sample_features = sample_batch['x']
+    args.feature_dim =  sample_features.shape[-2]
     model, diffusion = create_model_and_diffusion(args)
     model.to(dist_util.dev())
     print('Total params: %.2fM' % (model.num_parameters() / 1_000_000.0))
