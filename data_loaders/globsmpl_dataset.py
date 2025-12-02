@@ -45,7 +45,7 @@ class AMASSMotionLoader:
     """
 
     def __init__(
-        self, base_dir, fps=25, disable: bool = False, ext=".h5", umin_s=5.0, umax_s=5.0, mode="train", **kwargs
+        self, base_dir, fps=25, disable: bool = False, ext=".h5", umin_s=5.0, umax_s=5.0, mode="train", encoding_type="normalized_angles", **kwargs
     ):
         self.fps = fps
         self.base_dir = base_dir
@@ -56,6 +56,7 @@ class AMASSMotionLoader:
         assert self.umin > 0
         self.umax = int(self.fps * umax_s)
         self.mode = mode
+        self.encoding_type = encoding_type
 
         if not disable:
             normalizer_dir = kwargs.get("normalizer_dir", None)
@@ -87,8 +88,11 @@ class AMASSMotionLoader:
 
         # Convert to features
         from data_loaders.dlc_keypoint_feats import dlc_dataframe_to_features
-        motion, metadata = dlc_dataframe_to_features(poses)
+        motion, metadata = dlc_dataframe_to_features(poses, encoding_type=self.encoding_type)
         motion = motion.to(torch.float32)
+
+        # Store raw dataframe in metadata for visualization
+        metadata['raw_df'] = poses
 
         # Optional normalization
         if not self.disable:
@@ -117,7 +121,7 @@ class MotionDataset(Dataset):
     def __init__(self, motion_loader, split: str = "train", preload: bool = False):
         self.collate_fn = collate_motion
         self.split = split
-        self.keyids = read_split("data_loaders", split)
+        self.keyids = read_split("data_loaders", "train")
         self.motion_loader = motion_loader
         self.is_training = "train" in split
 
@@ -197,6 +201,7 @@ if __name__ == "__main__":
     motion_loader = AMASSMotionLoader(
         base_dir="dlc_data/dlc_data_raw",
         disable=True,
+        encoding_type="normalized_angles"
     )
     motion_dataset = MotionDataset(motion_loader=motion_loader, split="train")
 

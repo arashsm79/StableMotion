@@ -119,6 +119,8 @@ def add_data_options(parser: ArgumentParser):
         help="Path to preprocessed dataset.",
     )
     group.add_argument("--data_split", default="train", type=str, help="Dataset split for training.")
+    group.add_argument( "--encoding_type", default="normalized_angles", choices=["normalized_angles", "trajectory"], type=str, help="Encoding type for keypoint data."
+    )
     group.add_argument(
         "--normalizer_dir",
         default="dataset/meta_AMASS_20.0_fps_nh_globsmpl_corrupted_cano",

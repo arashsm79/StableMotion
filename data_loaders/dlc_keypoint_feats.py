@@ -112,7 +112,7 @@ import torch
 import numpy as np
 import pandas as pd
 from torch import Tensor
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 import einops
 
 
@@ -271,6 +271,254 @@ def keypoints_to_dlc_motion_features(keypoints: np.ndarray, labels: np.ndarray,
     return features
 
 
+def recenter_to_root_joint(coords: Tensor, root_joint_idx: int) -> Tuple[Tensor, Tensor]:
+    """
+    Recenter coordinates so root joint is at origin.
+    
+    Args:
+        coords: (T, N_animals, N_bodyparts, 2) coordinates
+        root_joint_idx: index of root joint (e.g., neck)
+        
+    Returns:
+        coords_recentered: (T, N_animals, N_bodyparts, 2) recentered coordinates
+        root_positions: (T, N_animals, 2) original root joint positions
+    """
+    root_positions = coords[:, :, root_joint_idx].clone()  # (T, N_animals, 2)
+    coords_recentered = coords - root_positions.unsqueeze(2)  # Broadcast to all bodyparts
+    return coords_recentered, root_positions
+
+
+def normalize_scale_frobenius(coords: Tensor) -> Tuple[Tensor, Tensor]:
+    """
+    Normalize coordinates by Frobenius norm of the pose.
+    
+    Args:
+        coords: (T, N_animals, N_bodyparts, 2) coordinates
+        
+    Returns:
+        coords_normalized: (T, N_animals, N_bodyparts, 2) normalized coordinates
+        scale_factors: (T, N_animals) normalization factors
+    """
+    # Compute Frobenius norm for each frame and animal
+    # Frobenius norm = sqrt(sum of squared coordinates)
+    coords_flat = coords.view(*coords.shape[:-2], -1)  # (T, N_animals, N_bodyparts*2)
+    scale_factors = torch.norm(coords_flat, dim=-1)  # (T, N_animals)
+    
+    # Avoid division by zero
+    scale_factors = torch.clamp(scale_factors, min=1e-8)
+    
+    # Normalize
+    coords_normalized = coords / scale_factors.unsqueeze(-1).unsqueeze(-1)
+    
+    return coords_normalized, scale_factors
+
+
+def compute_bone_angles(coords: Tensor, bone_pairs: List[Tuple[int, int]]) -> Tensor:
+    """
+    Compute angles of bone pairs.
+    
+    Args:
+        coords: (T, N_animals, N_bodyparts, 2) coordinates
+        bone_pairs: list of (bp1_idx, bp2_idx) tuples
+        
+    Returns:
+        angles: (T, N_animals * N_bone_pairs) bone angles in radians
+    """
+    T, N_animals, N_bodyparts, _ = coords.shape
+    
+    angles_list = []
+    
+    for animal_idx in range(N_animals):
+        animal_coords = coords[:, animal_idx]  # (T, N_bodyparts, 2)
+        
+        for bp1_idx, bp2_idx in bone_pairs:
+            if bp1_idx < N_bodyparts and bp2_idx < N_bodyparts:
+                # Bone vector
+                bone_vector = animal_coords[:, bp2_idx] - animal_coords[:, bp1_idx]  # (T, 2)
+                
+                # Compute angle with respect to x-axis
+                angles = torch.atan2(bone_vector[:, 1], bone_vector[:, 0])  # (T,)
+                angles_list.append(angles.unsqueeze(1))  # (T, 1)
+    
+    if angles_list:
+        angles = torch.cat(angles_list, dim=1)  # (T, N_animals * N_bone_pairs)
+    else:
+        angles = torch.zeros((T, 1))
+    
+    return angles
+
+
+def keypoints_to_normalized_angle_features(keypoints: np.ndarray, labels: np.ndarray,
+                                         animal_names: List[str], bodypart_names: List[str],
+                                         root_joint_name: str = 'neck') -> Tuple[Tensor, Dict]:
+    """
+    Convert DLC keypoints to normalized angle features for StableMotion.
+    
+    Pipeline:
+    - Recenter to root joint (neck)
+    - Normalize scale using Frobenius norm
+    - Compute normalized coordinates and velocities
+    - Compute bone angles and angular velocities
+    
+    Args:
+        keypoints: (T, N_animals, N_bodyparts, 3) keypoint data [x, y, likelihood]
+        labels: (T,) frame-level quality labels
+        animal_names: list of animal identifiers
+        bodypart_names: list of bodypart names
+        root_joint_name: name of root joint for centering
+        
+    Returns:
+        features: (T, feature_dim) motion features including label channel
+        transform_metadata: dict with transformation parameters for reversibility
+    """
+    keypoints = torch.from_numpy(keypoints).float()
+    labels = torch.from_numpy(labels).float()
+    
+    T, N_animals, N_bodyparts, _ = keypoints.shape
+    
+    # Extract coordinates and likelihoods
+    coords = keypoints[..., :2]  # (T, N_animals, N_bodyparts, 2)
+    likelihoods = keypoints[..., 2]  # (T, N_animals, N_bodyparts)
+    
+    # Handle missing data
+    coords = interpolate_missing_keypoints(coords, likelihoods)
+    
+    # Find root joint index
+    root_joint_idx = None
+    for idx, bp in enumerate(bodypart_names):
+        if root_joint_name.lower() in bp.lower():
+            root_joint_idx = idx
+            break
+    if root_joint_idx is None:
+        root_joint_idx = find_reference_bodypart(bodypart_names)
+    
+    # Recenter to root joint
+    coords_recentered, root_positions = recenter_to_root_joint(coords, root_joint_idx)
+    
+    # Normalize scale
+    coords_normalized, scale_factors = normalize_scale_frobenius(coords_recentered)
+    
+    # Compute velocities
+    coords_flat = coords_normalized.flatten(1)  # (T, N_animals*N_bodyparts*2)
+    coords_vel = my_diff(coords_flat)  # (T, N_animals*N_bodyparts*2)
+    
+    # Compute bone angles and angular velocities
+    bone_pairs = define_bone_pairs(bodypart_names)
+    bone_angles = compute_bone_angles(coords_normalized, bone_pairs)  # (T, N_animals*N_bone_pairs)
+    bone_angular_vel = my_diff(bone_angles)  # (T, N_animals*N_bone_pairs)
+    
+    # Pack all features
+    features = group_normalized_angle_features(
+        coords_normalized=coords_flat,
+        coords_vel=coords_vel,
+        bone_angles=bone_angles,
+        bone_angular_vel=bone_angular_vel,
+        labels=labels
+    )
+    
+    # Store transformation parameters for reversibility
+    transform_metadata = {
+        'root_positions': root_positions.numpy(),
+        'scale_factors': scale_factors.numpy(), 
+        'root_joint_idx': root_joint_idx,
+        'root_joint_name': root_joint_name
+    }
+    
+    return features, transform_metadata
+
+
+def group_normalized_angle_features(coords_normalized, coords_vel, bone_angles, bone_angular_vel, labels):
+    """
+    Group normalized angle features into a single feature vector.
+    
+    Args:
+        coords_normalized: (T, N_animals*N_bodyparts*2) normalized coordinates
+        coords_vel: (T, N_animals*N_bodyparts*2) coordinate velocities
+        bone_angles: (T, N_animals*N_bone_pairs) bone angles
+        bone_angular_vel: (T, N_animals*N_bone_pairs) angular velocities
+        labels: (T,) quality labels
+        
+    Returns:
+        features: (T, total_feature_dim) combined features
+    """
+    # Pack into a single feature vector
+    features, _ = einops.pack([
+        coords_normalized,    # (T, N_animals*N_bodyparts*2)
+        coords_vel,          # (T, N_animals*N_bodyparts*2)
+        bone_angles,         # (T, N_animals*N_bone_pairs)
+        bone_angular_vel,    # (T, N_animals*N_bone_pairs)
+        labels.unsqueeze(1)  # (T, 1) - quality labels
+    ], "T *")
+    
+    return features
+
+
+def ungroup_normalized_angle_features(features: Tensor, metadata: Dict) -> tuple[Tensor]:
+    """
+    Ungroup normalized angle features back to individual components.
+    
+    Args:
+        features: (T, feature_dim) packed features
+        metadata: metadata dict containing dimensions
+        
+    Returns:
+        tuple of individual feature tensors
+    """
+    n_animals = metadata['n_animals']
+    n_bodyparts = metadata['n_bodyparts']
+    n_bone_pairs = metadata['n_bone_pairs']
+    
+    coord_dim = n_animals * n_bodyparts * 2
+    angle_dim = n_animals * n_bone_pairs
+    
+    # Unpack features - order must match group_normalized_angle_features
+    (
+        coords_normalized,
+        coords_vel,
+        bone_angles,
+        bone_angular_vel,
+        labels
+    ) = einops.unpack(features, [
+        [coord_dim],           # coords_normalized
+        [coord_dim],           # coords_vel
+        [angle_dim],           # bone_angles
+        [angle_dim],           # bone_angular_vel
+        [1]                    # labels
+    ], "T *")
+    
+    labels = labels.squeeze(-1)  # Remove last dimension
+    
+    return (coords_normalized, coords_vel, bone_angles, bone_angular_vel, labels)
+
+
+def reverse_transformations(coords_normalized: Tensor, root_positions: Tensor, 
+                          scale_factors: Tensor) -> Tensor:
+    """
+    Reverse the normalization, rotation, and recentering transformations.
+    
+    Args:
+        coords_normalized: (T, N_animals, N_bodyparts, 2) normalized and rotated coordinates
+        root_positions: (T, N_animals, 2) original root joint positions
+        scale_factors: (T, N_animals) scale factors used for normalization
+        
+    Returns:
+        coords_original: (T, N_animals, N_bodyparts, 2) reconstructed original coordinates
+    """
+    T, N_animals, N_bodyparts, _ = coords_normalized.shape
+    coords_reconstructed = coords_normalized.clone()
+    
+    for t in range(T):
+        for animal_idx in range(N_animals):
+            # Reverse scale normalization
+            scale = scale_factors[t, animal_idx]
+            coords_reconstructed[t, animal_idx] *= scale
+            
+            # Add back root position
+            coords_reconstructed[t, animal_idx] += root_positions[t, animal_idx].unsqueeze(0)
+    
+    return coords_reconstructed
+
+
 def group_dlc_features(trajectory, trajectory_vel, coords_normalized, coords_vel, 
                       bone_lengths, bone_vel, labels):
     """
@@ -358,6 +606,8 @@ def interpolate_missing_keypoints(coords: Tensor, likelihoods: Tensor,
     Returns:
         coords_interp: interpolated coordinates
     """
+    # Simple approach: replace -1 with 0 and return
+    # TODO: Implement proper interpolation if needed
     coords_interp = coords.clone()
     coords_interp[coords_interp == -1] = 0
     return coords_interp
@@ -612,7 +862,7 @@ def group_keypoint_features(trajectory: Tensor, trajectory_vel: Tensor,
     return features
 
 
-def dlc_dataframe_to_features(df: pd.DataFrame, likelihood_threshold: float = 0.6) -> Dict:
+def dlc_dataframe_to_features(df: pd.DataFrame, likelihood_threshold: float = 0.6, encoding_type: str = 'normalized_angles') -> Dict:
     """
     Complete pipeline: DLC DataFrame -> motion features for StableMotion.
     Stores all metadata needed for perfect reconstruction.
@@ -620,6 +870,7 @@ def dlc_dataframe_to_features(df: pd.DataFrame, likelihood_threshold: float = 0.
     Args:
         df: DLC multi-animal dataframe
         likelihood_threshold: minimum likelihood for valid keypoints
+        encoding_type: feature encoding method ('trajectory' or 'normalized_angles')
         
     Returns:
         dict with:
@@ -629,20 +880,41 @@ def dlc_dataframe_to_features(df: pd.DataFrame, likelihood_threshold: float = 0.
     # Extract keypoints and labels
     keypoint_data = extract_dlc_keypoints(df, likelihood_threshold)
     
-    # Convert to motion features
-    features = keypoints_to_dlc_motion_features(
-        keypoint_data['keypoints'],
-        keypoint_data['labels'],
-        keypoint_data['animal_names'],
-        keypoint_data['bodypart_names']
-    )
-    
-    # Compute bone pairs to get count
-    bone_pairs = define_bone_pairs(keypoint_data['bodypart_names'])
-    n_bone_pairs = len(bone_pairs) * len(keypoint_data['animal_names'])
+    if encoding_type == 'trajectory':
+        # Original trajectory-based encoding
+        features = keypoints_to_dlc_motion_features(
+            keypoint_data['keypoints'],
+            keypoint_data['labels'],
+            keypoint_data['animal_names'],
+            keypoint_data['bodypart_names']
+        )
+        
+        # Compute bone pairs to get count
+        bone_pairs = define_bone_pairs(keypoint_data['bodypart_names'])
+        n_bone_pairs = len(bone_pairs) * len(keypoint_data['animal_names'])
+        transform_metadata = {}  # No transformation metadata needed
+        
+    elif encoding_type == 'normalized_angles':
+        # New normalized angles encoding
+        features, transform_metadata = keypoints_to_normalized_angle_features(
+            keypoint_data['keypoints'],
+            keypoint_data['labels'],
+            keypoint_data['animal_names'],
+            keypoint_data['bodypart_names']
+        )
+        
+        # Compute bone pairs to get count
+        bone_pairs = define_bone_pairs(keypoint_data['bodypart_names'])
+        n_bone_pairs = len(bone_pairs) * len(keypoint_data['animal_names'])
+        
+    else:
+        raise ValueError(f"Unknown encoding_type: {encoding_type}. Must be 'trajectory' or 'normalized_angles'")
     
     # Store comprehensive metadata for perfect reconstruction
     metadata = {
+        # Encoding type
+        'encoding_type': encoding_type,
+        
         # Basic dimensions
         'animal_names': keypoint_data['animal_names'],
         'bodypart_names': keypoint_data['bodypart_names'], 
@@ -672,9 +944,14 @@ def dlc_dataframe_to_features(df: pd.DataFrame, likelihood_threshold: float = 0.
         'original_shape': df.shape,
     }
     
+    # Add transformation metadata for normalized_angles encoding
+    if encoding_type == 'normalized_angles':
+        metadata.update(transform_metadata)
+    
     return features, metadata
 
 def fill_default_metadata(metadata: Dict) -> Dict:
+    metadata['encoding_type'] = 'trajectory'  # Default to trajectory encoding
     metadata['n_animals'] = 1
     metadata['n_bodyparts'] = 27
     metadata['n_bone_pairs'] = 27
@@ -692,7 +969,7 @@ def fill_default_metadata(metadata: Dict) -> Dict:
     return metadata
 
 
-def features_to_dlc_keypoints(features: Tensor, metadata: Dict = {}) -> pd.DataFrame:
+def features_to_dlc_keypoints(features: Tensor, metadata: Dict = {}, encoding_type: str = 'trajectory') -> pd.DataFrame:
     """
     Convert motion features back to exact DLC dataframe format.
     Perfect reconstruction of original dataframe structure.
@@ -700,26 +977,57 @@ def features_to_dlc_keypoints(features: Tensor, metadata: Dict = {}) -> pd.DataF
     Args:
         features: (T, feature_dim) motion features
         metadata: metadata dict from dlc_dataframe_to_features
+        encoding_type: feature encoding method ('trajectory' or 'normalized_angles')
         
     Returns:
         df: Reconstructed DLC DataFrame with exact original structure
     """
     if not metadata:
         metadata = fill_default_metadata(metadata)
-    # Ungroup features back to components
-    (trajectory, trajectory_vel, coords_normalized, coords_vel,
-     bone_lengths, bone_vel, labels) = ungroup_dlc_features(features, metadata)
     
-    n_animals = metadata['n_animals']
-    n_bodyparts = metadata['n_bodyparts']
-    T = features.shape[0]
+    # Get encoding type from metadata, default to trajectory for backward compatibility
+    actual_encoding_type = metadata.get('encoding_type', encoding_type)
     
-    # Reshape coordinates back to (T, N_animals, N_bodyparts, 2)
-    coords_normalized = coords_normalized.view(T, n_animals, n_bodyparts, 2)
-    likelihoods = torch.from_numpy(metadata['likelihood']).unsqueeze(-1)  # (T, N_animals, N_bodyparts, 1)
-    
-    # Add back the reference trajectory to get absolute coordinates
-    coords_absolute = coords_normalized + trajectory.unsqueeze(1).unsqueeze(1)
+    if actual_encoding_type == 'trajectory':
+        # Original trajectory-based decoding
+        (trajectory, trajectory_vel, coords_normalized, coords_vel,
+         bone_lengths, bone_vel, labels) = ungroup_dlc_features(features, metadata)
+        
+        n_animals = metadata['n_animals']
+        n_bodyparts = metadata['n_bodyparts']
+        T = features.shape[0]
+        
+        # Reshape coordinates back to (T, N_animals, N_bodyparts, 2)
+        coords_normalized = coords_normalized.view(T, n_animals, n_bodyparts, 2)
+        likelihoods = torch.from_numpy(metadata['likelihood']).unsqueeze(-1)  # (T, N_animals, N_bodyparts, 1)
+        
+        # Add back the reference trajectory to get absolute coordinates
+        coords_absolute = coords_normalized + trajectory.unsqueeze(1).unsqueeze(1)
+        
+    elif actual_encoding_type == 'normalized_angles':
+        # New normalized angles decoding
+        (coords_normalized, coords_vel, bone_angles, bone_angular_vel, labels) = ungroup_normalized_angle_features(features, metadata)
+        
+        n_animals = metadata['n_animals']
+        n_bodyparts = metadata['n_bodyparts']
+        T = features.shape[0]
+        
+        # Reshape coordinates back to (T, N_animals, N_bodyparts, 2)
+        coords_normalized = coords_normalized.view(T, n_animals, n_bodyparts, 2)
+        
+        # Reconstruct original coordinates from normalized features
+        # Note: This requires transformation parameters stored in metadata
+        root_positions = torch.from_numpy(metadata['root_positions'])
+        scale_factors = torch.from_numpy(metadata['scale_factors'])
+        
+        coords_absolute = reverse_transformations(
+            coords_normalized, root_positions, scale_factors
+        )
+            
+        likelihoods = torch.from_numpy(metadata['likelihood']).unsqueeze(-1)  # (T, N_animals, N_bodyparts, 1)
+        
+    else:
+        raise ValueError(f"Unknown encoding_type: {actual_encoding_type}. Must be 'trajectory' or 'normalized_angles'")
     
     # Combine coordinates with likelihoods: (T, N_animals, N_bodyparts, 3)
     keypoints = torch.cat([coords_absolute, likelihoods], dim=-1)

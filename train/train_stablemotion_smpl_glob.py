@@ -45,6 +45,7 @@ def main():
         split=args.data_split,
         data_dir=args.data_dir,
         normalizer_dir=args.normalizer_dir,
+        encoding_type=args.encoding_type,
     )
 
     print("creating model and diffusion...")
